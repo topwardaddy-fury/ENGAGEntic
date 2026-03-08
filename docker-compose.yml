@@ -1,0 +1,88 @@
+services:
+  # The Core Governance and Context Composition Engine
+  app:
+    build:
+      context: ./
+      dockerfile: ./core/Dockerfile
+    container_name: engagentic_core
+    ports:
+      - "${APP_PORT:-9091}:9091"
+    environment:
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_NAME=${POSTGRES_DB}
+      - DB_HOST=${DB_HOST:-db}
+      - DB_PORT=5432
+      - PORT=9091
+    depends_on:
+      - db
+    volumes:
+      - engagentic_profiles:/usr/src/app/profiles
+      - engagentic_standards:/usr/src/app/standards-library
+      - engagentic_registry:/usr/src/app/standards-registry
+      - engagentic_specs:/usr/src/app/spec-templates
+      - engagentic_workflows:/usr/src/app/workflows
+    # In the container, /usr/src/app contains 'core' contents.
+    # We need to ensure the engine knows where the libraries are.
+    # By setting build context to root, we can COPY the libraries.
+
+    # Developer UI / Context Composer
+  ui:
+    build:
+      context: ./
+      dockerfile: ./ui/Dockerfile
+    container_name: engagentic_ui
+    ports:
+      - "${UI_PORT:-9090}:9090"
+    environment:
+      - VITE_API_URL=http://localhost:9092/api
+
+  # Nginx Gateway
+  api:
+    build:
+      context: ./
+      dockerfile: ./api/Dockerfile
+    container_name: engagentic_api
+    ports:
+      - "${API_PORT:-9092}:9092"
+    depends_on:
+      - app
+      - ui
+
+  # Persistence for Sessions and Metadata 
+  db:
+    build:
+      context: ./db
+      dockerfile: Dockerfile
+    container_name: engagentic_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${DB_PORT:-9093}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # Local AI runtime for upcoming ENGAGEntic workflow agents
+  engagentic_ai:
+    build:
+      context: ./ai
+      dockerfile: Dockerfile
+    container_name: engagentic_ai
+    ports:
+      - "9094:9094"
+    environment:
+      - OLLAMA_HOST=0.0.0.0:9094
+    volumes:
+      - ollama_data:/root/.ollama
+    cpus: 10.0
+
+volumes:
+  postgres_data:
+  ollama_data:
+  engagentic_profiles:
+  engagentic_standards:
+  engagentic_registry:
+  engagentic_specs:
+  engagentic_workflows:

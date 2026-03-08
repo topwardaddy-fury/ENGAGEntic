@@ -1,0 +1,20 @@
+{
+    "name": "@engagentic/mcp",
+    "version": "1.0.0",
+    "description": "MCP Server for ENGAGEntic",
+    "main": "dist/index.js",
+    "type": "module",
+    "scripts": {
+        "build": "tsc",
+        "start": "node dist/index.js",
+        "dev": "ts-node src/index.ts"
+    },
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "latest"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "typescript": "^5.0.0",
+        "ts-node": "latest"
+    }
+}
