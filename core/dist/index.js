@@ -113,6 +113,11 @@ const GITHUB_API_URL = process.env.GITHUB_API_URL || 'https://api.github.com';
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const SCOUT_REPO_QUERY = process.env.SCOUT_REPO_QUERY
     || 'ai prompt engineering stars:>100 archived:false';
+const SCOUT_FALLBACK_REPO_QUERIES = (process.env.SCOUT_FALLBACK_REPO_QUERIES
+    || 'ai prompt security stars:>30 archived:false;llm prompt guardrails stars:>20 archived:false;prompt engineering best practices stars:>20 archived:false')
+    .split(';')
+    .map(q => q.trim())
+    .filter(Boolean);
 const scoutState = {
     running: false,
     enabled: SCOUT_ENABLED,
@@ -744,6 +749,7 @@ function shouldRejectScoutRepo(repo, readme) {
     const fullName = String(repo?.full_name || '').toLowerCase();
     const description = String(repo?.description || '').toLowerCase();
     const corpus = `${description}\n${readme}`.toLowerCase();
+    const hasReadme = readme.trim().length > 0;
     const disallowedNameTokens = ['awesome-', '-awesome', 'jailbreak', 'prompt-leak', 'prompt-hack'];
     if (disallowedNameTokens.some(token => fullName.includes(token))) {
         return { reject: true, reason: 'disallowed_name_pattern' };
@@ -751,7 +757,7 @@ function shouldRejectScoutRepo(repo, readme) {
     if (hasOneTimeSetupSignals(corpus)) {
         return { reject: true, reason: 'one_time_setup_content' };
     }
-    if (!hasReusableSignals(corpus)) {
+    if (hasReadme && !hasReusableSignals(corpus)) {
         return { reject: true, reason: 'missing_reusable_signals' };
     }
     return { reject: false, reason: '' };
@@ -786,46 +792,87 @@ async function githubRaw(pathname) {
     }
     return res.text();
 }
+async function githubReadmeText(owner, name) {
+    const encodedOwner = encodeURIComponent(owner);
+    const encodedName = encodeURIComponent(name);
+    try {
+        return await githubRaw(`/repos/${encodedOwner}/${encodedName}/readme`);
+    }
+    catch {
+        // Fallback: fetch JSON metadata + base64 content.
+        const payload = await githubJson(`/repos/${encodedOwner}/${encodedName}/readme`);
+        const content = String(payload?.content || '').replace(/\n/g, '');
+        if (!content) {
+            throw new Error('README content missing');
+        }
+        return Buffer.from(content, 'base64').toString('utf-8');
+    }
+}
 async function selectScoutCandidates(limit, excludeRepos) {
-    const payload = await githubJson(`/search/repositories?q=${encodeURIComponent(SCOUT_REPO_QUERY)}&sort=stars&order=desc&per_page=30`);
-    const items = Array.isArray(payload?.items) ? payload.items : [];
-    const searchTotal = Number(payload?.total_count || 0);
     const candidates = [];
     let scanned = 0;
     let skippedNoSecurity = 0;
     let skippedNotReusable = 0;
     let fetchErrors = 0;
-    for (const repo of items) {
+    let searchTotal = 0;
+    const seenRepos = new Set();
+    const queryQueue = [SCOUT_REPO_QUERY, ...SCOUT_FALLBACK_REPO_QUERIES].filter((q, idx, arr) => arr.indexOf(q) === idx);
+    for (const query of queryQueue) {
         if (candidates.length >= limit)
             break;
-        const fullName = String(repo?.full_name || '');
-        if (!fullName || excludeRepos.has(fullName))
-            continue;
-        scanned += 1;
-        try {
-            const [owner, name] = fullName.split('/');
-            if (!owner || !name)
-                continue;
-            const readme = await githubRaw(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/readme`);
-            if (!hasSecuritySignals(readme)) {
-                skippedNoSecurity += 1;
-                continue;
+        // Scan multiple pages to avoid dead-ends from inaccessible/low-quality top results.
+        for (let page = 1; page <= 4; page += 1) {
+            if (candidates.length >= limit)
+                break;
+            const payload = await githubJson(`/search/repositories?q=${encodeURIComponent(query)}&sort=stars&order=desc&per_page=50&page=${page}`);
+            const items = Array.isArray(payload?.items) ? payload.items : [];
+            if (query === SCOUT_REPO_QUERY && page === 1) {
+                searchTotal = Number(payload?.total_count || 0);
             }
-            if (shouldRejectScoutRepo(repo, readme).reject) {
-                skippedNotReusable += 1;
-                continue;
+            if (items.length === 0)
+                break;
+            for (const repo of items) {
+                if (candidates.length >= limit)
+                    break;
+                const fullName = String(repo?.full_name || '');
+                if (!fullName || excludeRepos.has(fullName) || seenRepos.has(fullName))
+                    continue;
+                seenRepos.add(fullName);
+                scanned += 1;
+                let readme = '';
+                const [owner, name] = fullName.split('/');
+                if (!owner || !name)
+                    continue;
+                try {
+                    readme = await githubReadmeText(owner, name);
+                }
+                catch {
+                    // Continue with description-only filtering instead of dropping the candidate outright.
+                    fetchErrors += 1;
+                    readme = '';
+                }
+                const corpus = `${String(repo?.description || '')}\n${readme}`;
+                const metaCorpus = `${String(repo?.full_name || '')}\n${String(repo?.description || '')}`.toLowerCase();
+                const hasMetaSecuritySignal = /(security|secure|safety|guardrail|policy|prompt injection|threat|prompt|llm|ai)/i.test(metaCorpus);
+                const securityPass = readme
+                    ? hasSecuritySignals(corpus)
+                    : hasMetaSecuritySignal;
+                if (!securityPass) {
+                    skippedNoSecurity += 1;
+                    continue;
+                }
+                if (shouldRejectScoutRepo(repo, corpus).reject) {
+                    skippedNotReusable += 1;
+                    continue;
+                }
+                candidates.push({
+                    fullName,
+                    htmlUrl: String(repo?.html_url || ''),
+                    stars: Number(repo?.stargazers_count || 0),
+                    description: String(repo?.description || ''),
+                    readme: readme || String(repo?.description || '')
+                });
             }
-            candidates.push({
-                fullName,
-                htmlUrl: String(repo?.html_url || ''),
-                stars: Number(repo?.stargazers_count || 0),
-                description: String(repo?.description || ''),
-                readme
-            });
-        }
-        catch {
-            // Skip repos without accessible README or with API errors.
-            fetchErrors += 1;
         }
     }
     return { candidates, scanned, skippedNoSecurity, skippedNotReusable, fetchErrors, searchTotal };
@@ -852,64 +899,146 @@ async function uniqueFilePath(baseDir, baseName) {
     }
     throw new Error(`Unable to allocate unique path for ${baseName}`);
 }
+function extractRepoLeaf(fullName) {
+    const parts = fullName.split('/');
+    return parts[parts.length - 1] || fullName;
+}
+function extractReadmeBullets(readme, maxItems = 8) {
+    const lines = readme.split('\n').map(l => l.trim());
+    const bullets = [];
+    for (const line of lines) {
+        if (bullets.length >= maxItems)
+            break;
+        if (!/^[-*]\s+/.test(line))
+            continue;
+        const text = line.replace(/^[-*]\s+/, '').replace(/[`*_#>\[\]\(\)]/g, '').trim();
+        if (text.length < 18 || text.length > 180)
+            continue;
+        bullets.push(text);
+    }
+    return bullets;
+}
+function extractReadmeHeadings(readme, maxItems = 5) {
+    const headings = readme
+        .split('\n')
+        .map(l => l.trim())
+        .filter(l => /^#{1,3}\s+/.test(l))
+        .map(l => l.replace(/^#{1,3}\s+/, '').trim())
+        .filter(Boolean);
+    return headings.slice(0, maxItems);
+}
+function decomposeCandidate(candidate) {
+    const repoLeaf = extractRepoLeaf(candidate.fullName);
+    const summary = compactText(candidate.readme.replace(/^#.*$/gm, '').replace(/```[\s\S]*?```/g, ''), 1400);
+    const bullets = extractReadmeBullets(candidate.readme, 7);
+    const headings = extractReadmeHeadings(candidate.readme, 5);
+    const profileName = `${repoLeaf} Community Profile`;
+    const standardTitle = `${repoLeaf} Community Standards`;
+    const specName = candidate.fullName;
+    const profileDescription = compactText(candidate.description || `Reusable role baseline derived from ${candidate.fullName}.`, 180);
+    const standardDescription = compactText(`Actionable standards extracted from ${candidate.fullName} for repeatable, secure AI work.`, 180);
+    const specDescription = compactText(`Operational specification that composes the Community profile and standards for ${candidate.fullName}.`, 180);
+    const profileBody = [
+        `You are operating as a community-derived AI role based on the ${candidate.fullName} repository.`,
+        '',
+        '## Role Mission',
+        'Apply reusable, secure prompt engineering practices for ongoing development workflows, not one-time setup tasks.',
+        '',
+        '## Role Focus Areas',
+        ...(headings.length > 0 ? headings.map(h => `- ${h}`) : ['- Secure prompting', '- Reusable workflow guidance', '- Measurable output quality']),
+        '',
+        '## Working Style',
+        '- Prefer repeatable patterns and explicit validation checkpoints.',
+        '- Surface tradeoffs and assumptions before implementation.',
+        '- Keep outputs concise, structured, and testable.',
+        '',
+        `Source repository: ${candidate.htmlUrl}`
+    ].join('\n');
+    const standardsList = bullets.length > 0
+        ? bullets.map(b => `- ${b}`)
+        : [
+            '- Validate assumptions and user inputs before generation.',
+            '- Enforce security and prompt-injection resistance in outputs.',
+            '- Use structured, testable response formats.',
+            '- Document constraints, caveats, and fallback paths.'
+        ];
+    const standardBody = [
+        '## Objective',
+        `Convert the ${candidate.fullName} guidance into enforceable, reusable operational standards.`,
+        '',
+        '## Standards',
+        ...standardsList,
+        '',
+        '## Enforcement',
+        '- Reject one-time onboarding/setup-only responses unless explicitly requested.',
+        '- Include validation and safety checks in all critical outputs.',
+        '- Prefer repeatable procedures over ad-hoc instructions.',
+        '',
+        '## Source Excerpt',
+        summary
+    ].join('\n');
+    const specBody = [
+        '## Objective',
+        `Assemble a reusable execution spec from ${candidate.fullName} with distinct profile + standards layers.`,
+        '',
+        '## When To Use',
+        '- You need a community-curated baseline for secure prompt engineering work.',
+        '- You want repeatable standards attached to a reusable role profile.',
+        '',
+        '## Assembly Contract',
+        '- Profile layer defines role mission, behavior, and decision style.',
+        '- Standards layer defines enforceable rules and quality gates.',
+        '- Specification layer binds both into a reusable execution set.',
+        '',
+        '## Source',
+        `- Repository: ${candidate.htmlUrl}`,
+        `- Stars: ${candidate.stars}`
+    ].join('\n');
+    return {
+        profileName,
+        profileDescription,
+        profileBody,
+        standardTitle,
+        standardDescription,
+        standardBody,
+        specName,
+        specDescription,
+        specBody
+    };
+}
 async function ingestScoutCandidate(candidate) {
     const slug = toSlug(candidate.fullName.replace('/', '-')) || `repo-${Date.now()}`;
     const profileId = `community-profile-${slug}`;
     const standardId = `community-standard-${slug}`;
     const specBaseName = `community-spec-${slug}`;
-    const summary = compactText(candidate.readme.replace(/^#.*$/gm, '').replace(/```[\s\S]*?```/g, ''), 1400);
-    const profileDraft = gray_matter_1.default.stringify([
-        'You are a Community profile for secure AI development guidance.',
-        'Use the associated standards to apply secure prompting practices.',
-        `Source repository: ${candidate.htmlUrl}`
-    ].join('\n\n'), {
+    const decomposed = decomposeCandidate(candidate);
+    const profileDraft = gray_matter_1.default.stringify(decomposed.profileBody, {
         id: profileId,
         type: 'profile',
         version: '1.0.0',
-        name: candidate.fullName,
+        name: decomposed.profileName,
         category: 'community',
         tags: ['Community'],
-        description: compactText(candidate.description || `Profile derived from ${candidate.fullName}`, 180),
+        description: decomposed.profileDescription,
         source_repo: candidate.fullName
     }).trim();
-    const standardDraft = gray_matter_1.default.stringify([
-        '## Objective',
-        'Apply reliable and secure AI development prompting guidance derived from the source specification.',
-        '',
-        '## Standards',
-        '- Validate assumptions and inputs.',
-        '- Include explicit security and safety checks.',
-        '- Keep implementation guidance concise and testable.',
-        '',
-        '## Source Excerpt',
-        summary
-    ].join('\n'), {
+    const standardDraft = gray_matter_1.default.stringify(decomposed.standardBody, {
         id: standardId,
         type: 'standard',
         version: '1.0.0',
-        title: candidate.fullName,
+        title: decomposed.standardTitle,
         category: 'community',
         tags: ['Community'],
-        description: compactText(candidate.description || `Standard derived from ${candidate.fullName}`, 180),
+        description: decomposed.standardDescription,
         source_repo: candidate.fullName
     }).trim();
     const profileMarkdown = await enhanceProfileForScout(profileDraft);
     const standardMarkdown = await enhanceStandardForScout(standardDraft);
-    const specMarkdown = gray_matter_1.default.stringify([
-        '## Objective',
-        `Use this Community specification derived from ${candidate.fullName}.`,
-        '',
-        '## Source',
-        `- Repository: ${candidate.htmlUrl}`,
-        `- Stars: ${candidate.stars}`,
-        '',
-        '## Notes',
-        'Community specification with linked profile and standard.'
-    ].join('\n'), {
+    const specMarkdown = gray_matter_1.default.stringify(decomposed.specBody, {
         type: 'specification',
         category: 'community',
-        name: candidate.fullName,
-        description: compactText(candidate.description || `Specification derived from ${candidate.fullName}`, 180),
+        name: decomposed.specName,
+        description: decomposed.specDescription,
         tags: ['Community'],
         source_repo: candidate.fullName,
         source_url: candidate.htmlUrl,
@@ -944,22 +1073,33 @@ async function runScout(reason) {
     try {
         const specs = await loaders.loadSpecs();
         const communitySpecs = specs.filter(isCommunitySpecification);
-        const missing = SCOUT_TARGET_COUNT - communitySpecs.length;
+        let missing = SCOUT_TARGET_COUNT - communitySpecs.length;
         if (missing <= 0)
             return;
         const knownRepos = new Set(communitySpecs
             .map(s => String(s.source_repo || '').trim())
             .filter(Boolean));
-        const selection = await selectScoutCandidates(missing, knownRepos);
-        scoutState.last_scanned = selection.scanned;
-        scoutState.last_candidates = selection.candidates.length;
-        scoutState.last_skipped_no_security = selection.skippedNoSecurity;
-        scoutState.last_skipped_not_reusable = selection.skippedNotReusable;
-        scoutState.last_repo_fetch_errors = selection.fetchErrors;
-        scoutState.last_search_total = selection.searchTotal;
-        for (const candidate of selection.candidates.slice(0, missing)) {
-            await ingestScoutCandidate(candidate);
-            scoutState.last_created += 1;
+        let pass = 0;
+        while (missing > 0 && pass < 4) {
+            pass += 1;
+            const selection = await selectScoutCandidates(missing, knownRepos);
+            scoutState.last_scanned += selection.scanned;
+            scoutState.last_candidates = selection.candidates.length;
+            scoutState.last_skipped_no_security += selection.skippedNoSecurity;
+            scoutState.last_skipped_not_reusable += selection.skippedNotReusable;
+            scoutState.last_repo_fetch_errors += selection.fetchErrors;
+            scoutState.last_search_total = Math.max(scoutState.last_search_total, selection.searchTotal);
+            if (selection.candidates.length === 0) {
+                break;
+            }
+            for (const candidate of selection.candidates.slice(0, missing)) {
+                await ingestScoutCandidate(candidate);
+                knownRepos.add(candidate.fullName);
+                scoutState.last_created += 1;
+                missing -= 1;
+                if (missing <= 0)
+                    break;
+            }
         }
     }
     catch (err) {
