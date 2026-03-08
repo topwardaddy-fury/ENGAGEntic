@@ -2,6 +2,8 @@
 
 ENGAGEntic is a context composition platform for AI systems. It assembles reusable prompt artifacts from Markdown libraries into normalized context payloads, renders them for multiple frameworks, and provides a UI + CLI for authoring and operations.
 
+<img width="1857" height="1104" alt="image" src="https://github.com/user-attachments/assets/01c4baf8-43d1-47bd-acb9-aa7ef705aa49" />
+
 ## What It Does
 
 - Composes layered context from hierarchical Markdown artifacts:
